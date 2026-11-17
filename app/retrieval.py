@@ -16,7 +16,7 @@ import sqlite_vec
 
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
-    RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
+    RAG_DB, RAG_DOCUMENT_IDS, RAG_NEIGHBOR_PAGES, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
     RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
 )
 
@@ -138,6 +138,38 @@ def search(query: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def add_neighbor_pages(hits: list[dict], pages: list[dict], window: int) -> list[dict]:
+    """各検索結果の直後に、同じ資料の前後windowページを足す。同じページは1回だけ返す。"""
+    if window <= 0:
+        return hits
+    index = {page["page_id"]: i for i, page in enumerate(pages)}
+    # 別の検索結果の近くでも、検索で当たったページは検索結果として返す
+    seen = {hit["page_id"] for hit in hits}
+    results = []
+    for hit in hits:
+        results.append({**hit, "retrieved_by": "search"})
+        i = index.get(hit["page_id"])
+        if i is None:
+            continue
+        for j in range(i - window, i + window + 1):
+            if j == i or not 0 <= j < len(pages):
+                continue
+            page = pages[j]
+            if page["document_id"] != hit["document_id"] or page["page_id"] in seen:
+                continue
+            seen.add(page["page_id"])
+            results.append({**page, "retrieved_by": "neighbor", "neighbor_of": hit["page_id"]})
+    return results
+
+
+def search_with_neighbors(query: str, window: int = RAG_NEIGHBOR_PAGES) -> list[dict]:
+    """検索結果に前後ページの本文を足して返す。windowが0なら通常の検索と同じ。"""
+    hits = search(query)
+    if window <= 0:
+        return hits
+    return add_neighbor_pages(hits, load_pages(RAG_SOURCE), window)
+
+
 def search_graph(query: str) -> dict:
     """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
@@ -201,9 +233,12 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
     parser.add_argument("query", help="調べたい内容")
+    parser.add_argument("--neighbors", type=int, default=RAG_NEIGHBOR_PAGES,
+                        help="検索結果の前後何ページを足すか（既定は環境変数 AIE_RAG_NEIGHBORS、未設定なら0）")
     args = parser.parse_args()
-    for i, result in enumerate(search(args.query), 1):
-        print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+    for i, result in enumerate(search_with_neighbors(args.query, args.neighbors), 1):
+        label = f"前後ページ（{result['neighbor_of']} の隣）" if result.get("retrieved_by") == "neighbor" else "検索結果"
+        print(f"\n{'=' * 60}\n{label} {i}\n{'=' * 60}")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
